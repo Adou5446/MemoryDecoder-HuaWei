@@ -211,3 +211,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+cal_loss_old.py
+
+logs/
+wandb/
+TEST246/
+dastore_miluvs/

@@ -16,7 +16,6 @@
 """
 Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...)
 on a text file or a dataset without using HuggingFace Trainer.
-
 Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
 https://huggingface.co/models?filter=text-generation
 """
@@ -32,9 +31,6 @@ import math
 import time
 import os
 import random
-import glob
-import re
-from datetime import timedelta
 from itertools import chain
 import numpy as np
 from pathlib import Path
@@ -48,7 +44,7 @@ import torch
 from functools import partial
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import InitProcessGroupKwargs, set_seed
+from accelerate.utils import set_seed
 from datasets import load_dataset,load_from_disk
 from huggingface_hub import HfApi
 from torch.utils.data import DataLoader
@@ -76,88 +72,6 @@ from utils.cal_loss import kl_loss_token, kl_loss_evaluate
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
-
-def wait_for_preparation_sync(accelerator, args):
-    num_machines = int(os.environ.get("NUM_MACHINES", "1"))
-    if accelerator.num_processes <= 1:
-        return
-
-    # Keep the original accelerator barrier for single-machine runs. The
-    # multi-node FSDP path can fail here because this barrier initializes HCCL
-    # before all machines finish the heavy KNN/dstore preparation work.
-    if num_machines <= 1:
-        accelerator.wait_for_everyone()
-        return
-
-    sync_id = os.environ.get("PREPARE_SYNC_ID")
-    if not sync_id:
-        fallback_run_name = args.run_name or "memdec"
-        fallback_port = os.environ.get("MASTER_PORT", "unknown")
-        sync_id = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{fallback_run_name}-{fallback_port}")
-        if accelerator.is_main_process:
-            logger.warning(
-                "PREPARE_SYNC_ID is not set; falling back to a derived sync id. "
-                "For repeated multi-node launches, pass a unique PREPARE_SYNC_ID to avoid stale markers."
-            )
-
-    sync_root = Path(args.output_dir or ".") / ".prepare_sync"
-    sync_dir = sync_root / sync_id
-    sync_dir.mkdir(parents=True, exist_ok=True)
-
-    marker_path = sync_dir / f"rank_{accelerator.process_index}.ready"
-    tmp_marker_path = sync_dir / f"rank_{accelerator.process_index}.tmp"
-    tmp_marker_path.write_text(
-        json.dumps(
-            {
-                "rank": accelerator.process_index,
-                "local_rank": accelerator.local_process_index,
-                "machine_rank": os.environ.get("MACHINE_RANK", "unknown"),
-                "pid": os.getpid(),
-                "host": os.uname().nodename,
-                "time": time.time(),
-            }
-        )
-    )
-    os.replace(tmp_marker_path, marker_path)
-
-    expected_ranks = accelerator.num_processes
-    timeout_s = int(os.environ.get("PREPARE_SYNC_TIMEOUT_SECONDS", "7200"))
-    poll_interval_s = float(os.environ.get("PREPARE_SYNC_POLL_SECONDS", "2"))
-    last_log_at = 0.0
-    start_at = time.time()
-
-    while True:
-        ready_ranks = set()
-        for ready_file in sync_dir.glob("rank_*.ready"):
-            match = re.fullmatch(r"rank_(\d+)\.ready", ready_file.name)
-            if match:
-                ready_ranks.add(int(match.group(1)))
-
-        if len(ready_ranks) >= expected_ranks:
-            break
-
-        elapsed = time.time() - start_at
-        if elapsed > timeout_s:
-            missing_ranks = sorted(set(range(expected_ranks)) - ready_ranks)
-            raise TimeoutError(
-                f"Timed out waiting for shared-file preparation sync after {timeout_s}s. "
-                f"Missing ranks: {missing_ranks}. Sync dir: {sync_dir}"
-            )
-
-        if accelerator.is_local_main_process and elapsed - last_log_at >= 60:
-            logger.info(
-                f"Waiting on shared-file preparation sync: "
-                f"{len(ready_ranks)}/{expected_ranks} ranks ready. Sync dir: {sync_dir}"
-            )
-            last_log_at = elapsed
-
-        time.sleep(poll_interval_s)
-
-    if accelerator.is_local_main_process:
-        logger.info(
-            f"Shared-file preparation sync complete: {expected_ranks}/{expected_ranks} ranks ready."
-        )
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -349,25 +263,8 @@ def parse_args():
     parser.add_argument(
         "--logging_steps",
         type=int,
-        default=20,
+        default=1,
         help="Logging steps",
-    )
-    parser.add_argument(
-        "--dataloader_num_workers",
-        type=int,
-        default=0,
-        help="Worker processes per rank for the training/eval dataloaders.",
-    )
-    parser.add_argument(
-        "--dataloader_prefetch_factor",
-        type=int,
-        default=2,
-        help="Number of prefetched batches per worker when dataloader_num_workers > 0.",
-    )
-    parser.add_argument(
-        "--detect_anomaly",
-        action="store_true",
-        help="Enable PyTorch autograd anomaly detection for debugging only. This significantly slows training.",
     )
     parser.add_argument(
         "--from_scratch",
@@ -421,21 +318,14 @@ def main():
     args = parse_args()
 
     accelerator_log_kwargs = {}
-    process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=1))
-    tracking_enabled = args.with_tracking and args.report_to != "none"
 
-    if tracking_enabled:
+    if args.with_tracking:
         accelerator_log_kwargs["log_with"] = args.report_to
         accelerator_log_kwargs["project_dir"] = args.output_dir
 
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        kwargs_handlers=[process_group_kwargs],
-        **accelerator_log_kwargs,
-    )
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
     
-    trackers_initialized = False
-    if tracking_enabled and args.report_to == "wandb":
+    if args.report_to == "wandb":
         accelerator.init_trackers(
             project_name=args.project_name, 
             config=args,
@@ -447,7 +337,6 @@ def main():
                 },
             }
         )
-        trackers_initialized = True
 
     # Make one log on every process with the configuration for debugging.
     if accelerator.is_local_main_process:
@@ -505,10 +394,6 @@ def main():
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-    if hasattr(config, "use_cache"):
-        config.use_cache = False
-        logger.info("Disabled config.use_cache for training.")
-
     if args.model_name_or_path and not args.from_scratch:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
@@ -520,301 +405,85 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
-
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-        logger.info("Disabled model.config.use_cache for training.")
         
     # -------------------------------------------------Preprocess Dataset------------------------------------------------------------
     # Default to use gpt tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
         
     lm_datasets = load_from_disk(args.dataset_name)[args.dataset_split_name]
-    
-    logger.info(f"Original input_ids length: {len(lm_datasets[0]['input_ids'])}, will truncate to {args.block_size} to match KNN dstore")
 
     # Modify model embedding size
     vocab_size = len(tokenizer)
     model.resize_token_embeddings(vocab_size)
 
     # --------------------------------------------------Load Memmap-------------------------------------------------------------------
-
-    # Load knn dstore - MUST use the merged/complete KNN file, not rank-specific files
+    
+    # Load knn dstore and val file
     if accelerator.is_main_process:
-        logger.info(f"Loading knn dstore from {args.knn_save_path}...")
-
-    # Check if the path is a directory (merged dataset) or a file
-    if os.path.isdir(args.knn_save_path):
-        # It's a directory containing the merged dataset
-        knn_dstore = load_from_disk(args.knn_save_path)
-        logger.info(f"Loaded merged KNN dataset from directory: {args.knn_save_path}")
-    elif os.path.exists(args.knn_save_path):
-        # It's a single Arrow file
-        knn_dstore = Dataset.from_file(args.knn_save_path)
-        logger.info(f"Loaded KNN dataset from file: {args.knn_save_path}")
-    else:
-        # Try to find rank-specific files and load them all
-        logger.warning(f"KNN file not found: {args.knn_save_path}")
-        logger.info("Attempting to load and merge rank-specific KNN files...")
-
-        import re
-        knn_dir = os.path.dirname(args.knn_save_path)
-        knn_basename = os.path.basename(args.knn_save_path).replace('.arrow', '')
-
-        # Find all rank files
-        rank_files = []
-        for f in os.listdir(knn_dir):
-            if f.startswith(knn_basename) and '_rank' in f and f.endswith('.arrow'):
-                rank_num = int(re.search(r'_rank(\d+)', f).group(1))
-                rank_files.append((rank_num, os.path.join(knn_dir, f)))
-
-        if not rank_files:
-            raise FileNotFoundError(f"No KNN files found matching pattern: {knn_basename}_rank*.arrow")
-
-        # Sort by rank number
-        rank_files.sort(key=lambda x: x[0])
-        logger.info(f"Found {len(rank_files)} rank-specific KNN files")
-
-        # Load and concatenate all rank files
-        knn_datasets = []
-        for rank_num, rank_file in rank_files:
-            logger.info(f"Loading rank {rank_num}: {rank_file}")
-            ds = Dataset.from_file(rank_file)
-            knn_datasets.append(ds)
-            logger.info(f"  Loaded {len(ds):,} records")
-
-        # Concatenate all datasets
-        from datasets import concatenate_datasets
-        knn_dstore = concatenate_datasets(knn_datasets)
-        logger.info(f"Merged KNN dataset: {len(knn_dstore):,} total records")
-
+        logger.info(f"Loading knn dstore and val dstore from {args.knn_save_path}...")
+    knn_dstore = Dataset.from_file(args.knn_save_path)
     knn_dstore.set_format(type='torch', columns=['id_cnt', 'token_id', 'prob', 'label'])
-    logger.info(f"KNN dstore total size: {len(knn_dstore):,} records")
-    logger.info(f"All ranks will use the same complete KNN dstore for token-level indexing")
-
-    # Build concat_start mapping: dstore_range token index -> KNN file index.
-    # The mapping depends on how the dstore/KNN artifacts were generated, not on
-    # the current training world size. Future training may run on any number of
-    # cards as long as we know the dstore generation layout.
-    logger.info("Building dstore_range -> KNN index mapping (concat_start)...")
-    _ranges = np.array(lm_datasets['dstore_range'])  # (N, 2)
-    _cnts = _ranges[:, 1] - _ranges[:, 0]
-    _N = len(lm_datasets)
-    import re as _re
-    _dstore_rank_files = sorted(
-        glob.glob(os.path.join(os.path.dirname(args.knn_save_path),
-                               "dstore_*_rank*.arrow")),
-        key=lambda x: int(_re.search(r'rank(\d+)', x).group(1))
-    )
-    if not _dstore_rank_files:
-        raise FileNotFoundError(
-            f"No dstore rank files found next to {args.knn_save_path}; "
-            "cannot build dstore_range -> KNN mapping."
-        )
-
-    _metadata_path = os.path.join(os.path.dirname(args.knn_save_path), "dstore_metadata.json")
-    _B_s = 1
-    if os.path.exists(_metadata_path):
-        with open(_metadata_path, "r") as f:
-            _dstore_meta = json.load(f)
-        _meta_batch = _dstore_meta.get("per_device_eval_batch_size")
-        if isinstance(_meta_batch, int) and _meta_batch > 0:
-            _B_s = _meta_batch
-        logger.info(f"Loaded dstore metadata from {_metadata_path}: {_dstore_meta}")
-    else:
-        logger.warning(
-            f"dstore metadata not found at {_metadata_path}; "
-            "falling back to per-device eval batch size = 1 for concat_start."
-        )
-
-    _W = len(_dstore_rank_files)
-    _chunk_s = _B_s * _W
-    _si_arr = np.arange(_N)
-    _r_arr = (_si_arr % _chunk_s) // _B_s
-    _pos_in_rank = (_si_arr // _chunk_s) * _B_s + (_si_arr % _B_s)
-
-    logger.info(
-        f"Dstore generation layout: world_size={_W}, "
-        f"per_device_eval_batch_size={_B_s}, chunk_size={_chunk_s}"
-    )
-
-    # Dstore rank file sizes (tokens per rank)
-    _dstore_sizes = [len(Dataset.from_file(f)) for f in _dstore_rank_files]
-    logger.info(f"Dstore rank sizes: {_dstore_sizes}")
-    _dstore_cum = np.array([0] + list(np.cumsum(_dstore_sizes)))
-    _rank_token_cum = []
-    for _r in range(_W):
-        _mask = _r_arr == _r
-        _rank_token_cum.append(np.concatenate([[0], np.cumsum(_cnts[_mask])]))
-    concat_start = np.zeros(_N, dtype=np.int64)
-    for _r in range(_W):
-        _mask = _r_arr == _r
-        _rank_si = _si_arr[_mask]
-        _pir = _pos_in_rank[_mask]
-        concat_start[_rank_si] = _dstore_cum[_r] + _rank_token_cum[_r][_pir]
-    _range_starts = _ranges[:, 0]  # monotone increasing, used for si lookup
-    logger.info(f"concat_start built for {_N:,} samples")
-
-    def knn_collate_fn(batch, knn_dstore, vocab_size, rank_global_offset):
+    
+    def knn_collate_fn(batch, knn_dstore, vocab_size):
+        """
+        Custom collate function that handles kNN data processing directly
+        
+        Args:
+            batch: The batch of data
+            knn_dstore: The KNN datastore
+            vocab_size: Size of the vocabulary
+            device: The device to move tensors to (accelerator.device)
+        """
+        # Apply default collation to the batch
         collated_batch = default_data_collator(batch)
-
-        # Process each sample individually - effective data may be at different positions
+        
+        # Process kNN data for all items in the batch
         knn_labels_list = []
-        knn_row_ids_list = []
-        knn_col_ids_list = []
-        knn_values_list = []
-        valid_indices = []
-        knn_row_offset = 0
-
-        batch_size = collated_batch['input_ids'].shape[0]
-
-        for idx in range(batch_size):
-            # CRITICAL FIX: KNN dstore is organized by TOKEN, not by sample!
-            # Each sample has a dstore_range [start, end] that indicates which tokens
-            # in the KNN dstore correspond to this sample.
-            # The dstore_range was computed during embedding saving and reflects the
-            # token-level indices in the KNN file.
-
-            cur_range = collated_batch["dstore_range"][idx]
+        knn_probs_list = []
+        
+        # Process each dstore_range in the batch
+        for idx, cur_range in enumerate(collated_batch["dstore_range"]):
+            # Get range boundaries
             start, end = int(cur_range[0]), int(cur_range[1])
-            seq_len = end - start  # exclusive range: [start, end)
-
-            # Validate range
-            if start < 0 or end > len(knn_dstore):
-                logger.error(f"Invalid dstore_range: [{start}, {end}], knn_dstore size: {len(knn_dstore)}")
-                continue
             
-            # Get raw labels from the original sample (full block_size length, no truncation)
-            raw_labels = collated_batch['labels'][idx]
-
-            # Find first non-padding (-100) position (sliding window overlap region)
-            nonpad_positions = (raw_labels != -100).nonzero(as_tuple=False)
-            first_valid = int(nonpad_positions[0].item()) if nonpad_positions.numel() > 0 else raw_labels.size(0)
-
-            # KNN alignment:
-            # dstore_range uses text_ds original order; KNN file uses concat_dstore order.
-            # Use concat_start[si] to map dstore_range -> KNN file index.
-            si = int(np.searchsorted(_range_starts, start, side='left'))
-            knn_start = int(concat_start[si])
-            knn_end = knn_start + (end - start)
-
-            if knn_start >= knn_end:
-                continue
-
-            try:
-                knn_dstore_slice = knn_dstore[knn_start:knn_end]
-            except Exception as e:
-                logger.error(f"Error fetching KNN data for range [{knn_start}, {knn_end}): {e}")
-                continue
-
-            # Extract KNN labels directly
-            cur_knn_label = knn_dstore_slice["label"]
-            if not torch.is_tensor(cur_knn_label):
-                cur_knn_label = torch.as_tensor(cur_knn_label, dtype=torch.long)
-            else:
-                cur_knn_label = cur_knn_label.to(dtype=torch.long)
-
-            # Debug logging: compare KNN labels vs training labels
-            if idx == 0:
-                knn_lbl_sample = cur_knn_label[:10].tolist()
-                # valid training labels = raw_labels[first_valid:]
-                train_lbl_sample = raw_labels[raw_labels != -100][:10].tolist()
-                logger.debug(f"Sample {idx}: dstore_range=[{start},{end}), first_valid={first_valid}, knn_len={knn_end-knn_start}")
-                logger.debug(f"  KNN labels[0:10]:   {knn_lbl_sample}")
-                logger.debug(f"  Train labels[fv:fv+10]: {train_lbl_sample}")
+            # Slice the knn_dstore
+            knn_dstore_slice = knn_dstore.select(range(start, end))
+            
+            # Extract kNN label
+            # Note that since datasets version 4.0.0, we can't use direct column selecting since the implementation of lazy columns, see pr https://github.com/huggingface/datasets/pull/7614
+            cur_knn_label = knn_dstore_slice[:]["label"]
             knn_labels_list.append(cur_knn_label)
-
+            
             # Extract token IDs and probabilities
-            cur_token_id = knn_dstore_slice["token_id"]
-            cur_prob = knn_dstore_slice["prob"]
-
-            # HF Datasets returns ragged columns like token_id/prob as a Python list of
-            # tensors (one tensor per position). Keep that structure and flatten it in a
-            # way that preserves the original row-wise assignment semantics.
-            if torch.is_tensor(cur_token_id):
-                token_id_rows = [cur_token_id.to(dtype=torch.long)]
-            else:
-                token_id_rows = []
-                for row in cur_token_id:
-                    if torch.is_tensor(row):
-                        token_id_rows.append(row.to(dtype=torch.long))
-                    else:
-                        token_id_rows.append(torch.as_tensor(row, dtype=torch.long))
-
-            if torch.is_tensor(cur_prob):
-                prob_rows = [cur_prob.to(dtype=torch.float32)]
-            else:
-                prob_rows = []
-                for row in cur_prob:
-                    if torch.is_tensor(row):
-                        prob_rows.append(row.to(dtype=torch.float32))
-                    else:
-                        prob_rows.append(torch.as_tensor(row, dtype=torch.float32))
-
-            # Preserve the sparse KNN representation in the batch and delay dense
-            # materialization until loss computation on device. This keeps the
-            # DataLoader workers from creating huge dense CPU tensors that then
-            # have to travel through shared memory.
-            n = knn_end - knn_start  # = end - start = seq_len
-            if token_id_rows:
-                row_lengths = torch.as_tensor([row.numel() for row in token_id_rows], dtype=torch.long)
-                row_ids = torch.repeat_interleave(torch.arange(len(token_id_rows), dtype=torch.long), row_lengths)
-                col_ids = torch.cat(token_id_rows, dim=0)
-                values = torch.cat(prob_rows, dim=0)
-                knn_row_ids_list.append(row_ids + knn_row_offset)
-                knn_col_ids_list.append(col_ids)
-                knn_values_list.append(values)
-
-            knn_row_offset += n
-            valid_indices.append(idx)
-
-        # Handle empty batch (all samples had invalid ranges)
-        if not valid_indices or len(knn_labels_list) == 0:
-            logger.warning("Empty batch after filtering invalid samples, returning None")
-            return None
-
-        # Filter out any invalid samples while preserving the original per-sample tensors.
-        if len(valid_indices) != batch_size:
-            valid_index_tensor = torch.as_tensor(valid_indices, dtype=torch.long)
-            collated_batch['input_ids'] = collated_batch['input_ids'].index_select(0, valid_index_tensor)
-            collated_batch['attention_mask'] = collated_batch['attention_mask'].index_select(0, valid_index_tensor)
-            collated_batch['labels'] = collated_batch['labels'].index_select(0, valid_index_tensor)
-            if "dstore_range" in collated_batch:
-                collated_batch["dstore_range"] = collated_batch["dstore_range"].index_select(0, valid_index_tensor)
-
-        # CRITICAL: Use original GPU code approach - concatenate KNN data directly (1D tensors)
-        # Do NOT pad! Just concatenate all samples' KNN data into one long vector
+            cur_token_id = knn_dstore_slice[:]["token_id"]
+            cur_prob = knn_dstore_slice[:]["prob"]
+            
+            # Create sparse probability tensor
+            cur_knn_prob = torch.zeros(size=(end - start, vocab_size))
+            for i in range(end - start):
+                assert cur_token_id[i].max() < vocab_size, f"token_id {cur_token_id[i]} is out of vocab size {vocab_size}"
+                cur_knn_prob[i][cur_token_id[i]] = cur_prob[i]
+            
+            knn_probs_list.append(cur_knn_prob)
+        
+        # Concatenate and move to device
         collated_batch["knn_label"] = torch.cat(knn_labels_list, dim=0)
-        collated_batch["knn_num_rows"] = torch.tensor(knn_row_offset, dtype=torch.long)
-        if knn_row_ids_list:
-            collated_batch["knn_row_ids"] = torch.cat(knn_row_ids_list, dim=0)
-            collated_batch["knn_col_ids"] = torch.cat(knn_col_ids_list, dim=0)
-            collated_batch["knn_values"] = torch.cat(knn_values_list, dim=0)
-        else:
-            collated_batch["knn_row_ids"] = torch.empty(0, dtype=torch.long)
-            collated_batch["knn_col_ids"] = torch.empty(0, dtype=torch.long)
-            collated_batch["knn_values"] = torch.empty(0, dtype=torch.float32)
-
+        collated_batch["knn_probs"] = torch.cat(knn_probs_list, dim=0)
+        
         return collated_batch
     
     # --------------------------------------------------Evaluation-----------------------------------------------------------
     if args.do_test:
-        # Let Accelerate own the distributed sharding. Manually slicing the dataset
-        # here would cause a second shard inside `accelerator.prepare(...)`.
-        logger.info(
-            f"Evaluation will shard the full dataset of {len(lm_datasets)} samples "
-            f"across {accelerator.num_processes} process(es)."
-        )
-
         collate_with_knn = partial(
             knn_collate_fn,
             knn_dstore=knn_dstore,
             vocab_size=vocab_size,
-            rank_global_offset=0,
         )
         eval_dataloader = DataLoader(
-            lm_datasets, collate_fn=collate_with_knn, batch_size=args.per_device_eval_batch_size,
-            num_workers=0,
+            lm_datasets, collate_fn=collate_with_knn, batch_size=args.per_device_eval_batch_size, 
+            shuffle=False,
+            num_workers=4,
+            prefetch_factor=4,
             pin_memory=True
         )
         # Create a partial function with your specific parameters
@@ -833,14 +502,7 @@ def main():
                     labels=None
                 )
                 
-                nll_loss, lm_loss, token_num = kl_loss_evaluate(
-                    outputs.logits,
-                    batch,
-                    tokenizer,
-                    args,
-                    batch["knn_label"],
-                    batch.get("knn_probs"),
-                )
+                nll_loss, lm_loss, token_num = kl_loss_evaluate(outputs.logits, batch, tokenizer, args, batch["knn_label"], batch["knn_probs"])
                 eval_joint += nll_loss.item()
                 eval_lm += lm_loss.item()
                 total_token_num += token_num
@@ -864,62 +526,27 @@ def main():
     # --------------------------------------------------Start Training-----------------------------------------------------------
     train_dataset = lm_datasets
     eval_dataset = None
-
+    
     # DataLoaders creation:
-    # Since KNN dstore is organized by TOKEN (not by sample), and each sample has a dstore_range
-    # that points to its tokens in the KNN file, we can use any distribution strategy.
-    # We keep the full dataset here and let Accelerate handle distributed sharding.
-    logger.info(
-        f"Training will shard the full dataset of {len(train_dataset)} samples "
-        f"across {accelerator.num_processes} process(es)."
-    )
-
-    dataloader_kwargs = {
-        "num_workers": args.dataloader_num_workers,
-        "pin_memory": True,
-    }
-    if args.dataloader_num_workers > 0:
-        dataloader_kwargs["persistent_workers"] = True
-        dataloader_kwargs["prefetch_factor"] = max(1, args.dataloader_prefetch_factor)
-
-    logger.info(
-        "DataLoader config: "
-        f"num_workers={dataloader_kwargs['num_workers']}, "
-        f"pin_memory={dataloader_kwargs['pin_memory']}, "
-        f"persistent_workers={dataloader_kwargs.get('persistent_workers', False)}, "
-        f"prefetch_factor={dataloader_kwargs.get('prefetch_factor', 'n/a')}"
-    )
-
     collate_with_knn = partial(
         knn_collate_fn,
         knn_dstore=knn_dstore,
         vocab_size=vocab_size,
-        rank_global_offset=0,
     )
     train_dataloader = DataLoader(
-        train_dataset,
-        collate_fn=collate_with_knn,
-        batch_size=args.per_device_train_batch_size,
-        **dataloader_kwargs,
+        train_dataset, collate_fn=collate_with_knn, batch_size=args.per_device_train_batch_size, 
+        shuffle=False,
+        num_workers=4,
+        prefetch_factor=4,
+        pin_memory=True
     )
     if eval_dataset is not None:
-        logger.info(
-            f"Validation will shard the full dataset of {len(eval_dataset)} samples "
-            f"across {accelerator.num_processes} process(es)."
-        )
-
-        collate_with_knn_eval = partial(
-            knn_collate_fn,
-            knn_dstore=knn_dstore,
-            vocab_size=vocab_size,
-            rank_global_offset=0,
-        )
-
         eval_dataloader = DataLoader(
-            eval_dataset,
-            collate_fn=collate_with_knn_eval,
-            batch_size=args.per_device_eval_batch_size,
-            **dataloader_kwargs,
+            eval_dataset, collate_fn=collate_with_knn, batch_size=args.per_device_eval_batch_size, 
+            shuffle=False,
+            num_workers=4,
+            prefetch_factor=4,
+            pin_memory=True
         )
     else:
         eval_dataloader = None
@@ -955,9 +582,6 @@ def main():
         else args.max_train_steps * accelerator.num_processes,
     )
 
-    logger.info("Waiting for all ranks to finish KNN/dstore preparation before DDP wrapping...")
-    wait_for_preparation_sync(accelerator, args)
-
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
@@ -977,7 +601,7 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if tracking_enabled and not trackers_initialized:
+    if args.with_tracking:
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
@@ -1035,12 +659,10 @@ def main():
     logging_interval_lm_loss = 0
     total_loss = 0
 
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    logger.info(f"Autograd anomaly detection enabled: {args.detect_anomaly}")
+    torch.autograd.set_detect_anomaly(True)
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
-        
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
@@ -1048,10 +670,6 @@ def main():
             active_dataloader = train_dataloader
 
         for step, batch in enumerate(active_dataloader):
-            # Skip if batch is None (indicating an issue with KNN data alignment)
-            if batch is None:
-                continue
-            
             with accelerator.accumulate(model):
                 outputs = model(
                     input_ids=batch["input_ids"],
@@ -1059,19 +677,7 @@ def main():
                     labels=None
                 )
                 
-                loss, kl_loss, lm_loss = kl_loss_token(
-                    outputs.logits,
-                    batch,
-                    tokenizer,
-                    args,
-                    batch["knn_label"],
-                    batch.get("knn_probs"),
-                    alpha=args.alpha,
-                )
-
-                # Skip if all tokens are padding
-                if loss is None:
-                    continue
+                loss, kl_loss, lm_loss = kl_loss_token(outputs.logits, batch, tokenizer, args, batch["knn_label"], batch["knn_probs"], alpha=args.alpha)
 
                 # We keep track of the loss at each epoch
                 logging_interval_loss += loss.detach().float()

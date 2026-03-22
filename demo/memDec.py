@@ -17,6 +17,12 @@ from transformers.generation.utils import (
 )
 from transformers.utils import ModelOutput
 
+# Import NPU device management utilities
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.npu_device import get_device
+
 @dataclass
 class MemoryDecoderOutput(ModelOutput):
 
@@ -50,6 +56,11 @@ class MemoryDecoder(PreTrainedModel, GenerationMixin):
         self.knn_generator = knn_generator
         self.lmbda = float(lmbda)
         self.knn_temp = float(knn_temp)
+        
+        # Move models to NPU device
+        device = get_device()
+        self.base_lm.to(device)
+        self.knn_generator.to(device)
         
     # ------------------------------------------------------------------ #
     #                       1. forward()

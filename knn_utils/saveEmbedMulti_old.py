@@ -1,4 +1,3 @@
-import json
 import os
 
 import torch.nn.functional as F
@@ -58,10 +57,10 @@ class KNNWrapperMulti(object):
         self.probe = probe
         self.knn_sim_func = DIST.l2
         self.knn_keytype = KEY_TYPE.last_ffn_input
-        self.knn_gpu = False
+        self.knn_gpu = knn_gpu and torch.cuda.is_available() and torch.cuda.device_count() > 0
         self.local_process_index = local_process_index
 
-        self.device = torch.device('npu' if torch.npu.is_available() else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.vocab_size = None
         self.activation_capturer = None
@@ -83,11 +82,31 @@ class KNNWrapperMulti(object):
         logger.info(f'Reading datastore took {time.time() - start} s')
         cpu_index.nprobe = self.probe
 
-        gpu_index = cpu_index
+        if self.knn_gpu:
+            start = time.time()
+            # 1. Set maximum GPU memory allocation
+            res = faiss.StandardGpuResources()
+            res.setTempMemory(40 * 1024 * 1024 * 1024)
 
+            # 2. Create a more memory-efficient cloner
+            co = faiss.GpuClonerOptions()
+            co.useFloat16 = True           # Use half precision
+            co.verbose = True              # See what's happening
+
+            gpu_index = faiss.index_cpu_to_gpu(res, self.local_process_index, cpu_index, co)
+            
+            logger.info(f'Moving index to GPU took {time.time() - start} s')
+        else:
+            gpu_index = cpu_index
+
+        # make_direct_map() allows calling reconstruct(n), 
+        # and reconstructing key vectors given their ids
+        # currently, this is implemented only for CPU indexes:
+        # https://github.com/facebookresearch/faiss/issues/2181
         cpu_index.make_direct_map()
 
         start_time = time.time()
+        # Load val_file using pickle
         with open(self.val_file, 'rb') as f:
             self.vals = pickle.load(f).to(self.device)
         logger.info(f'Loading keys and vals to memory took {time.time() - start_time} s')
@@ -270,9 +289,10 @@ class KNNSaverMulti(object):
         self.knn_keytype = KEY_TYPE.last_ffn_input if knn_keytype is None else knn_keytype
         self.training_args = training_args
         
+        # Multi-GPU settings
         self.world_size = training_args.world_size if training_args else 1
         self.process_index = training_args.local_process_index if training_args else 0
-        self.device = training_args.device if training_args else torch.device('npu' if torch.npu.is_available() else 'cpu')
+        self.device = training_args.device if training_args else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.accelerator = accelerator
         
         self.model = None
@@ -280,60 +300,34 @@ class KNNSaverMulti(object):
         self.is_encoder_decoder = None
         self.dstore_idx = 0
         self.hook_handles = []
-        self.knn_gpu = False
-        self.log_interval = 1000  # Log every 1000 saves to reduce output
+        self.knn_gpu = knn_gpu
         
         if self.process_index ==0:
             if not os.path.exists(self.dstore_dir):
                 logger.info(f"Creating directory {self.dstore_dir} for storing the datastore.")
                 os.makedirs(self.dstore_dir, exist_ok=True)
 
-    def _write_metadata(self):
-        if self.process_index != 0:
-            return
-
-        metadata = {
-            "eval_subset": self.eval_subset,
-            "dimension": self.dimension,
-            "world_size": self.world_size,
-            "per_device_eval_batch_size": getattr(self.training_args, "per_device_eval_batch_size", None),
-        }
-        metadata_path = os.path.join(self.dstore_dir, "dstore_metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-        logger.info(f"Wrote dstore metadata to {metadata_path}: {metadata}")
-
     def _get_arrow_file_path(self):
-        """Get the Arrow file path (separate file for each process)"""
-        # Extract model family from dstore_dir (e.g., './dstore/qwen2.5-7B/wikitext' -> 'qwen2.5')
-        # This is more reliable than model.config.model_type which returns 'qwen2' for Qwen2.5 models
-        parent_dir = os.path.basename(os.path.dirname(self.dstore_dir))
-        model_family = parent_dir.split('-')[0] if '-' in parent_dir else parent_dir
-        
-        # Each process writes to its own file to avoid gather operations
-        base_path = get_dstore_path(self.dstore_dir, model_family, self.eval_subset, self.dimension)
-        # Add process index to filename to avoid conflicts
-        base_path = base_path.replace('.arrow', f'_rank{self.process_index}.arrow')
+        """Get the Arrow file path (single file for all processes)"""
+        base_path = get_dstore_path(self.dstore_dir, self.model.config.model_type, self.eval_subset, self.dimension)
         return base_path
 
     def _setup_arrow_writer(self):
-        """Set up the Arrow writer for streaming writes (each process writes its own file)"""
-        logger.info(f"Setting up arrow writer for rank {self.process_index}...")
-        # Define schema for the Arrow file
-        fields = [
-            pa.field('keys', pa.list_(pa.float16(), self.dimension)),
-            pa.field('vals', pa.int32())
-        ]
-        schema = pa.schema(fields)
-        
-        # Create the Arrow file and writer using streaming format
-        self.arrow_file = pa.OSFile(self.arrow_file_path, 'wb')
-        self.arrow_writer = pa.ipc.new_stream(self.arrow_file, schema)
+        """Set up the Arrow writer for streaming writes (only on main process)"""
+        if self.process_index == 0:
+            logger.info(f"Setting up arrow writer...")
+            # Define schema for the Arrow file
+            fields = [
+                pa.field('keys', pa.list_(pa.float16(), self.dimension)),
+                pa.field('vals', pa.int32())
+            ]
+            schema = pa.schema(fields)
+            
+            # Create the Arrow file and writer using streaming format
+            self.arrow_file = pa.OSFile(self.arrow_file_path, 'wb')
+            self.arrow_writer = pa.ipc.new_stream(self.arrow_file, schema)
 
     def _save_step_data(self, keys, vals):
-        if not hasattr(self, 'arrow_writer'):
-            return
-        
         # Detach from computation graph and ensure contiguous memory
         keys_tensor = keys.detach().contiguous()
         vals_tensor = vals.detach().contiguous()
@@ -342,37 +336,39 @@ class KNNSaverMulti(object):
         keys_tensor = keys_tensor.to(dtype=torch.float16)
         vals_tensor = vals_tensor.to(dtype=torch.int32)
 
-        # No gather operation - each process writes its own data directly
-        # This avoids collective communication errors in multi-GPU/NPU setup
+        # Gather from all processes
+        all_keys = self.accelerator.gather_for_metrics(keys_tensor)
+        all_vals = self.accelerator.gather_for_metrics(vals_tensor)
+
         shift = 0 if self.is_encoder_decoder else 1
         if shift == 1:
-            keys_tensor = keys_tensor[:, :-shift]
-        keys_tensor = keys_tensor.flatten(0, 1)  # (batch * time, dim)
-        vals_tensor = vals_tensor[:, shift:].flatten(0, 1)  # (batch * time)
+            all_keys = all_keys[:, :-shift]
+        all_keys = all_keys.flatten(0, 1)  # (batch * time, dim)
+        all_vals = all_vals[:, shift:].flatten(0, 1)  # (batch * time)
 
-        nonpad_mask = vals_tensor != -100
-        keys_tensor = keys_tensor[nonpad_mask]
-        vals_tensor = vals_tensor[nonpad_mask]
+        nonpad_mask = all_vals != -100
+        all_keys = all_keys[nonpad_mask]
+        all_vals = all_vals[nonpad_mask]
             
-        # Each process writes its own data to its own file
-        # Convert tensors back to numpy arrays
-        keys_np = keys_tensor.cpu().numpy().astype(np.float16)
-        vals_np = vals_tensor.cpu().numpy().astype(np.int32)
-        
-        # Create Arrow arrays
-        keys_list = [keys_np[i] for i in range(keys_np.shape[0])]
-        keys_array = pa.array(keys_list, type=pa.list_(pa.float16(), self.dimension))
-        vals_array = pa.array(vals_np, type=pa.int32())
-        
-        # Create batch and write
-        batch = pa.RecordBatch.from_arrays([keys_array, vals_array], ['keys', 'vals'])
-        self.arrow_writer.write_batch(batch)
-        
-        self.dstore_idx += keys_np.shape[0]
-        
-        # Only log periodically to reduce output
-        if self.dstore_idx % self.log_interval == 0:
-            logger.info(f"Rank {self.process_index}: Total saved: {self.dstore_idx}")
+        # Only main process writes to file
+        if self.process_index == 0:
+            # Convert tensors back to numpy arrays
+            all_keys_np = all_keys.cpu().numpy().astype(np.float16)
+            all_vals_np = all_vals.cpu().numpy().astype(np.int32)
+            
+            # Create Arrow arrays
+            keys_list = [all_keys_np[i] for i in range(all_keys_np.shape[0])]
+            keys_array = pa.array(keys_list, type=pa.list_(pa.float16(), self.dimension))
+            vals_array = pa.array(all_vals_np, type=pa.int32())
+            
+            # Create batch and write
+            batch = pa.RecordBatch.from_arrays([keys_array, vals_array], ['keys', 'vals'])
+            self.arrow_writer.write_batch(batch)
+            
+            logger.info(f"Main process: Flushed buffer, total saved: {self.dstore_idx + all_keys_np.shape[0]}")
+            self.dstore_idx += all_keys_np.shape[0]
+
+        self.accelerator.wait_for_everyone()
         
     def break_into(self, model):
         self.model = model
@@ -399,21 +395,16 @@ class KNNSaverMulti(object):
         final_layer = KNNWrapperMulti.get_model_last_layer(model.config.model_type)(model)
         self.register_hook(final_layer, self.post_forward_hook)
 
-        # Create directory first (all ranks need to do this)
-        Path(self.dstore_dir).mkdir(parents=True, exist_ok=True)
-
         # Set up Arrow writer now that we have the model info
         self.arrow_file_path = self._get_arrow_file_path()
         if os.path.exists(self.arrow_file_path):
-            file_size = os.path.getsize(self.arrow_file_path)
-            if file_size > 0:
-                logger.info(f'Arrow file already exists at {self.arrow_file_path} with size {file_size} bytes.')
-            else:
-                logger.info(f'Arrow file exists but is empty ({file_size} bytes) at {self.arrow_file_path}. Recreating...')
-                self._setup_arrow_writer()
+            logger.info(f'Arrow file already exists at {self.arrow_file_path}.')
         else:
             logger.info(f"Creating Arrow file at {self.arrow_file_path}.")
             self._setup_arrow_writer()
+
+        # Create directory if it doesn't exist
+        Path(self.dstore_dir).mkdir(parents=True, exist_ok=True)
         
     def pre_forward_hook(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if labels is None:
@@ -433,8 +424,8 @@ class KNNSaverMulti(object):
         self.hook_handles.append(handle)
     
     def break_out(self):
-        # Close the Arrow writer for every rank (each rank has its own file)
-        if hasattr(self, 'arrow_writer'):
+        # Close the Arrow writer (main process only)
+        if self.process_index == 0 and hasattr(self, 'arrow_writer'):
             self.arrow_writer.close()
             self.arrow_file.close()
         
@@ -445,8 +436,6 @@ class KNNSaverMulti(object):
         if self.model is not None and hasattr(self.model, 'broken_into') and self.model.broken_into is not None:
             self.model.forward = self.original_forward_func
             self.model.broken_into = None
-
-        self._write_metadata()
         
     def build_index(self, num_keys_to_add_at_a_time=1_000_000, ncentroids=4096, seed=42, code_size=32, probe=8):
         logger.info('Loading Dataset...')
@@ -503,14 +492,10 @@ class ActivationCapturer(nn.Module):
 
 
 def get_dstore_path(dstore_dir, model_type, eval_subset, dimension):
-    # Remove model size suffix from model_type (e.g., 'qwen2-7B' -> 'qwen2')
-    model_type_clean = model_type.split('-')[0] if '-' in model_type else model_type
-    return f'{dstore_dir}/dstore_{model_type_clean}_{eval_subset}_{dimension}.arrow'
+    return f'{dstore_dir}/dstore_{model_type}_{eval_subset}_{dimension}.arrow'
 
 def get_index_path(dstore_dir, model_type, eval_subset, dimension):
-    # Remove model size suffix from model_type (e.g., 'qwen2-7B' -> 'qwen2')
-    model_type_clean = model_type.split('-')[0] if '-' in model_type else model_type
-    return f'{dstore_dir}/index_{model_type_clean}_{eval_subset}_{dimension}.index'
+    return f'{dstore_dir}/index_{model_type}_{eval_subset}_{dimension}.index'
 
 def get_result_path(dstore_dir, model_type, dstore_size, dimension):
     return f'{dstore_dir}/test_retrieve_result(no_recompute).pickle'

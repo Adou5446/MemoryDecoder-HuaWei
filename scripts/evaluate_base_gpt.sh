@@ -1,8 +1,10 @@
-DATASET=/path/to/dataset
-MODEL=/path/to/base/model
+# Update paths for your environment
+DATASET="/data/processed_data/wikitext-qwen"
+MODEL=model/Qwen2.5-7B
 OUTPUT_DIR=tmp/
 
-NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 CUDA_VISIBLE_DEVICES=0 python \
+# Use NPU environment instead of CUDA
+python \
     -m \
     train_base \
     --model_name_or_path ${MODEL} \

@@ -1,4 +1,4 @@
-# Evaluation script with accelerate for multi-GPU perplexity evaluation
+# Evaluation script with accelerate for multi-NPU perplexity evaluation
 
 import sys
 import inspect
@@ -49,6 +49,9 @@ from loguru import logger
 
 # Import KNN utils
 from knn_utils.saveEmbedMulti import KNNSaverMulti, KNNWrapperMulti, KEY_TYPE, DIST
+
+# Import NPU device management utilities
+from utils.npu_device import get_device
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -376,12 +379,18 @@ def main():
     # -------------------------------------------------Inject KNN------------------------------------------------------------
 
     dimension = model.config.hidden_size
+    device = get_device()
+    
+    # Load KNN generator model
     if os.path.exists(f"{args.knn_generator_path}/pytorch_model.bin"):
-        knn_generator = AutoModelForCausalLM.from_pretrained(args.knn_generator_path, use_safetensors=False).to(model.device)
+        knn_generator = AutoModelForCausalLM.from_pretrained(args.knn_generator_path, use_safetensors=False).to(device)
     else:
-        knn_generator = AutoModelForCausalLM.from_pretrained(args.knn_generator_path, use_safetensors=True).to(model.device)
+        knn_generator = AutoModelForCausalLM.from_pretrained(args.knn_generator_path, use_safetensors=True).to(device)
     
     knn_generator.resize_token_embeddings(vocab_size)
+    
+    # Move base model to device
+    model = model.to(device)
 
     # --------------------------------------------------Evaluation-----------------------------------------------------------
     
@@ -458,10 +467,26 @@ def main():
         eval_lm = math.exp(eval_lm / token_cnt)
         eval_joint = math.exp(eval_joint / token_cnt)
         logger.info(f"token count: {token_cnt}")
-        
+
         if accelerator.is_main_process:
             print(f"lm perplexity: {eval_lm}")
             print(f"joint perplexity: {eval_joint}")
+
+            result = {
+                "lm_perplexity": eval_lm,
+                "joint_perplexity": eval_joint,
+                "ppl_reduction_pct": (eval_lm - eval_joint) / eval_lm * 100,
+                "token_count": int(token_cnt),
+                "lmbda": args.lmbda,
+                "knn_temp": args.knn_temp,
+                "model": args.model_name_or_path,
+                "knn_generator": args.knn_generator_path,
+            }
+            os.makedirs(args.output_dir, exist_ok=True)
+            out_path = os.path.join(args.output_dir, "eval_joint_result.json")
+            with open(out_path, "w") as f:
+                json.dump(result, f, indent=2)
+            logger.info(f"Results saved to {out_path}")
 
 if __name__ == "__main__":
     main()

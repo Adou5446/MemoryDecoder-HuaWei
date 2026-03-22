@@ -203,6 +203,9 @@ class KNNArguments:
     k: int = field(default=1024)
     knn_temp: float = field(default=1.0)
     probe: int = field(default=32)
+    
+    # Note: knn_gpu parameter is kept for compatibility but will be ignored on NPU systems
+    # On NPU, FAISS always runs on CPU regardless of this setting
 
 def main():
     # -----------------------------------------------------------Arguments-----------------------------------------------------------
@@ -249,8 +252,9 @@ def main():
     transformers.utils.logging.add_handler(InterceptHandler())
 
     # Log on each process the small summary:
+    device_type = "NPU" if "npu" in str(training_args.device).lower() else ("GPU" if "cuda" in str(training_args.device).lower() else "CPU")
     logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_{device_type.lower()}: {training_args.n_gpu if device_type == 'GPU' else 'N/A'}"
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
@@ -336,6 +340,8 @@ def main():
         eval_dataset = lm_datasets[data_args.eval_subset]
         if data_args.max_eval_samples is not None:
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
+
+    training_args.dataloader_drop_last = True 
 
     # Initialize our Trainer
     trainer = Trainer(

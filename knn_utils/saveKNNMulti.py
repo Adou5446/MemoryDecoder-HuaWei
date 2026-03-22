@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import pickle
 import logging
@@ -14,8 +15,71 @@ from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from tqdm import tqdm
 from datasets import Dataset
+import datasets
 from transformers import AutoTokenizer
 from loguru import logger
+
+def find_all_rank_files(dstore_path):
+    """
+    Find all rank-specific Arrow files in the same directory.
+    
+    Args:
+        dstore_path: Path to a single dstore file (e.g., dstore_qwen2.5_train_3584_rank0.arrow)
+        
+    Returns:
+        List of all rank files sorted by rank index
+    """
+    dstore_dir = os.path.dirname(dstore_path)
+    filename = os.path.basename(dstore_path)
+    
+    # Extract base filename pattern (without rank suffix)
+    # e.g., dstore_qwen2.5_train_3584_rank0.arrow -> dstore_qwen2.5_train_3584
+    base_pattern = re.sub(r'_rank\d+\.arrow$', '', filename)
+    
+    # Find all files matching pattern
+    all_files = []
+    for f in os.listdir(dstore_dir):
+        match = re.match(rf'^{re.escape(base_pattern)}_rank(\d+)\.arrow$', f)
+        if match:
+            rank = int(match.group(1))
+            all_files.append((rank, os.path.join(dstore_dir, f)))
+    
+    # Sort by rank index
+    all_files.sort(key=lambda x: x[0])
+    
+    if not all_files:
+        raise ValueError(f"No rank files found matching pattern: {base_pattern}_rank*.arrow in {dstore_dir}")
+    
+    logger.info(f"Found {len(all_files)} rank files: {[f[1] for f in all_files]}")
+    return [f[1] for f in all_files]
+
+def load_and_concatenate_dstore(rank_files):
+    """
+    Load and concatenate multiple Arrow files.
+    
+    Args:
+        rank_files: List of Arrow file paths
+        
+    Returns:
+        Concatenated dataset
+    """
+    logger.info(f"Loading {len(rank_files)} rank files...")
+    
+    datasets_list = []
+    total_samples = 0
+    
+    for i, file_path in enumerate(rank_files):
+        logger.info(f"Loading rank file {i+1}/{len(rank_files)}: {file_path}")
+        ds = Dataset.from_file(file_path)
+        datasets_list.append(ds)
+        total_samples += len(ds)
+        logger.info(f"  Loaded {len(ds)} samples")
+    
+    logger.info(f"Concatenating {total_samples} total samples...")
+    concatenated = datasets.concatenate_datasets(datasets_list)
+    logger.info(f"Concatenated dataset size: {len(concatenated)}")
+    
+    return concatenated
 
 class KNNSearchMulti:
     def __init__(self, 
@@ -52,6 +116,14 @@ class KNNSearchMulti:
         self.world_size = self.accelerator.num_processes
         self.process_index = self.accelerator.local_process_index
         
+        # Modify output_path to include rank suffix for each process
+        output_path_obj = Path(self.output_path)
+        output_dir = output_path_obj.parent
+        output_stem = output_path_obj.stem
+        output_ext = output_path_obj.suffix
+        self.output_path = str(output_dir / f"{output_stem}_rank{self.process_index}{output_ext}")
+        logger.info(f"Process {self.process_index}: Output path: {self.output_path}")
+        
         # Get vocab size from tokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         self.vocab_size = len(tokenizer)
@@ -59,21 +131,39 @@ class KNNSearchMulti:
         
         # Load FAISS index (each process loads it)
         self.reconstruct_index, self.index = self._load_faiss_index()
-        
-        # Create dataset and dataloader
-        dataset = Dataset.from_file(self.dstore_path)
+
+        # ALIGNMENT FIX: Each process loads ONLY its own rank file.
+        # accelerator.prepare(dataloader) would interleave batches across processes
+        # (process 0 gets batches [0,8,16,...], process 1 gets [1,9,17,...]),
+        # which would break the train_memdec concat_start mapping that assumes
+        # knn_rank{i} corresponds exactly to dstore_rank{i} tokens in order.
+        all_rank_files = find_all_rank_files(self.dstore_path)
+        if self.process_index >= len(all_rank_files):
+            raise ValueError(
+                f"Process {self.process_index} has no rank file "
+                f"(only {len(all_rank_files)} rank files found)"
+            )
+        my_rank_file = all_rank_files[self.process_index]
+        logger.info(f"Process {self.process_index}: Loading its own rank file: {my_rank_file}")
+        dataset = Dataset.from_file(my_rank_file)
+        logger.info(f"Process {self.process_index}: Loaded {len(dataset):,} samples")
+
         # Set format to torch for proper tensor conversion
         dataset.set_format(type='torch', columns=['keys', 'vals'])
-        
+
+        # vals must cover ALL 116M indices (FAISS returns global indices 0..N-1).
+        # Keep on CPU: knns from FAISS are CPU tensors, indexing stays on CPU.
         if self.val_path is not None:
-            # Load val_file using pickle
             with open(self.val_path, 'rb') as f:
-                self.vals = pickle.load(f).to(self.device)
+                self.vals = pickle.load(f).cpu()
         else:
-            self.vals = dataset['vals'].to(self.device)
-        
+            # Fallback: only current rank's vals (will fail if knns exceed rank size)
+            self.vals = dataset['vals'].cpu()
+
+        # Each process runs its own DataLoader — do NOT call accelerator.prepare()
+        # to avoid accelerate re-sharding our already-sharded data.
         self.dataloader = DataLoader(
-            dataset, 
+            dataset,
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=False,
@@ -82,56 +172,52 @@ class KNNSearchMulti:
             prefetch_factor=4
         )
         
-        # Prepare dataloader with accelerator
-        self.dataloader = self.accelerator.prepare(self.dataloader)
-        
-        # Initialize Arrow writer on main process
-        if self.process_index == 0:
-            self._setup_arrow_writer()
+        # Initialize Arrow writer for each process
+        self._setup_arrow_writer()
     
     def _load_faiss_index(self):
         """Load FAISS index and optionally move to GPU"""
         logger.info(f"Process {self.process_index}: Loading FAISS index from {self.index_path}")
-        
+
+        # Use all available cores divided by number of processes.
+        available_cores = os.cpu_count() or 144
+        threads_per_process = max(1, available_cores // self.world_size)
+        faiss.omp_set_num_threads(threads_per_process)
+        logger.info(f"Process {self.process_index}: FAISS using {threads_per_process} threads")
+
         cpu_index = faiss.read_index(self.index_path, faiss.IO_FLAG_ONDISK_SAME_DIR)
         cpu_index.nprobe = self.probe
-        
-        if self.knn_gpu and faiss.get_num_gpus() > 0:
-            co = faiss.GpuClonerOptions()
-            co.useFloat16 = True
-            gpu_id = self.process_index % faiss.get_num_gpus()
-            gpu_index = faiss.index_cpu_to_gpu(faiss.StandardGpuResources(), gpu_id, cpu_index, co)
-            
-            logger.info(f"Process {self.process_index}: Moved index to all GPU with shard")
-        
-        cpu_index.make_direct_map()
-        
-        return cpu_index, gpu_index
+
+        # make_direct_map() is only needed for reconstruct() calls which we don't use.
+        # Skipping it saves significant memory (116M-entry map per process).
+
+        return cpu_index, cpu_index
     
     def _setup_arrow_writer(self):
-        """Set up Arrow writer for streaming writes (main process only)"""
-        if self.process_index == 0:
-            # Define schema for output Arrow file
-            fields = [
-                pa.field('id_cnt', pa.int32()),
-                pa.field('token_id', pa.list_(pa.int32())),
-                pa.field('prob', pa.list_(pa.float16())),  # Changed to float16
-                pa.field('label', pa.int32())
-            ]
-            schema = pa.schema(fields)
-            
-            # Create output directory if needed
-            Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
-            
-            # Create Arrow file and writer
-            self.arrow_file = pa.OSFile(self.output_path, 'wb')
-            self.arrow_writer = pa.ipc.new_stream(self.arrow_file, schema)
+        """Set up Arrow writer for streaming writes (each process writes to its own file)"""
+        # Define schema for output Arrow file
+        fields = [
+            pa.field('id_cnt', pa.int32()),
+            pa.field('token_id', pa.list_(pa.int32())),
+            pa.field('prob', pa.list_(pa.float16())),  # Changed to float16
+            pa.field('label', pa.int32())
+        ]
+        schema = pa.schema(fields)
+        
+        # Create output directory if needed
+        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        # Create Arrow file and writer for this process
+        self.arrow_file = pa.OSFile(self.output_path, 'wb')
+        self.arrow_writer = pa.ipc.new_stream(self.arrow_file, schema)
+        logger.info(f"Process {self.process_index}: Arrow writer initialized for {self.output_path}")
 
     def get_knns(self, queries, ignore_first=False):
-        if not self.knn_gpu:
-            queries = queries.cpu()
-        dists, knns = self.index.search(queries.to(torch.float32), self.k)
-        dists, knns = dists.to(self.device), knns.to(self.device)
+        # FAISS CPU search always needs float32 CPU tensors.
+        dists, knns = self.index.search(queries.cpu().to(torch.float32), self.k)
+        # Keep results on CPU to avoid unnecessary NPU transfers.
+        dists = dists.cpu()
+        knns = knns.cpu()
         
         # If we need to ignore the first nearest neighbor
         # There seems to be a bug of faiss 1.11.0 cuvs, that the searched result isn't sorted by distance, please use faiss 1.12.0 w/o cuvs instead
@@ -142,14 +228,15 @@ class KNNSearchMulti:
     
     def knns_to_probs(self, knns, neg_dists):
         """Compute kNN probability distribution following the reference implementation"""
-        probs = torch.nn.functional.softmax(neg_dists / self.knn_temp, dim=-1).to(torch.float32).to(self.device)
+        # All tensors stay on CPU (FAISS outputs are CPU, vals is CPU).
+        probs = torch.nn.functional.softmax(neg_dists / self.knn_temp, dim=-1).to(torch.float32)
 
-        vals_at_knns = self.vals[knns].to(self.device)  # (batch * time, k)
-        knn_probs = torch.full(size=(vals_at_knns.shape[:-1] + (self.vocab_size,)), fill_value=0.0).to(self.device) \
-            .scatter_add(dim=-1, index=vals_at_knns, src=probs)  # (batch * time, vocab)
-        
+        vals_at_knns = self.vals[knns]  # (batch, k)
+        knn_probs = torch.full(size=(vals_at_knns.shape[:-1] + (self.vocab_size,)), fill_value=0.0) \
+            .scatter_add(dim=-1, index=vals_at_knns.long(), src=probs)  # (batch, vocab)
+
         knn_probs = F.normalize(knn_probs, p=1, dim=-1)
-        
+
         return knn_probs
     
     def sparsify_distribution(self, knn_probs):
@@ -172,86 +259,50 @@ class KNNSearchMulti:
             sorted_probs = valid_probs[sorted_indices]
             
             id_cnt_list.append(len(sorted_ids))
-            token_id_list.append(sorted_ids.to(self.device))
-            prob_list.append(sorted_probs.to(self.device).to(torch.float16))  # Convert to float16
+            token_id_list.append(sorted_ids.cpu())
+            prob_list.append(sorted_probs.cpu().to(torch.float16))
         
         return id_cnt_list, token_id_list, prob_list
     
     def _save_step_data(self, id_cnt, token_id, prob, label):
         """Save data for current step using streaming Arrow format"""
-        # Convert id_cnt to tensor for gathering
-        id_cnt_tensor = torch.tensor(id_cnt, device=self.device)
+        # Convert id_cnt to tensor (stay on CPU, no NPU needed for Arrow writing)
+        id_cnt_tensor = torch.tensor(id_cnt)
         
-        # Step 1: Gather id_cnt and label first
-        id_cnt_gathered = self.accelerator.gather_for_metrics(id_cnt_tensor)
-        label_gathered = self.accelerator.gather_for_metrics(label)
-        
-        # Step 2: Get the largest value of id_cnt from gathered tensor
-        max_tokens_global = torch.max(id_cnt_gathered).item()
-        
-        # Step 3: Pad the original token_id and prob lists to the largest id_cnt
+        # Each process writes its own data directly (no gathering)
         batch_size = id_cnt_tensor.shape[0]
-        token_id_padded = torch.full((batch_size, max_tokens_global), -1, dtype=torch.long, device=self.device)
-        prob_padded = torch.zeros((batch_size, max_tokens_global), dtype=torch.float16, device=self.device)
         
-        for i in range(batch_size):
-            valid_count = id_cnt[i]
-            current_token_id = token_id[i]
-            current_prob = prob[i]
-            
-            # For the last batch, there may be list longer than max_tokens_global since there are some remainder. Truncate them !
-            if current_token_id.shape[0] > max_tokens_global:
-                logger.debug(f"Truncating token_id and prob for batch {i} from {current_token_id.shape[0]} to {max_tokens_global}")
-                valid_count = max_tokens_global
-                current_token_id = current_token_id[:max_tokens_global]
-                current_prob = current_prob[:max_tokens_global]
-            
-            token_id_padded[i, :valid_count] = current_token_id
-            prob_padded[i, :valid_count] = current_prob
+        # Create Arrow arrays from local data
+        id_cnt_np = id_cnt_tensor.cpu().numpy()
+        label_np = label.cpu().numpy()
         
-        # Step 4: Gather token_id_tensor and prob_tensor
-        token_id_gathered_padded = self.accelerator.gather_for_metrics(token_id_padded)
-        prob_gathered_padded = self.accelerator.gather_for_metrics(prob_padded)
+        # Convert token_id and prob lists to numpy arrays
+        token_id_list_np = [t.cpu().numpy() for t in token_id]
+        prob_list_np = [p.cpu().numpy() for p in prob]
         
-        # Step 5: Unpad the result token_id_tensor and prob_tensor to original length list
-        total_batch_size = id_cnt_gathered.shape[0]
-        token_id_gathered = []
-        prob_gathered = []
+        pass  # progress logged every 500 batches in process()
         
-        for i in range(total_batch_size):
-            valid_count = id_cnt_gathered[i].item()
-            token_id_gathered.append(token_id_gathered_padded[i, :valid_count].cpu().numpy())
-            prob_gathered.append(prob_gathered_padded[i, :valid_count].cpu().numpy())
+        # Create Arrow arrays
+        id_cnt_array = pa.array(id_cnt_np, type=pa.int32())
+        token_id_array = pa.array(token_id_list_np, type=pa.list_(pa.int32()))
+        prob_array = pa.array(prob_list_np, type=pa.list_(pa.float16()))
+        label_array = pa.array(label_np, type=pa.int32())
         
-        # Only main process writes to file
-        if self.process_index == 0:
-            id_cnt_np = id_cnt_gathered.cpu().numpy()
-            label_np = label_gathered.cpu().numpy()
-            
-            logger.info(f"id_cnt_np shape: {id_cnt_np.shape} ; token_id_gathered length: {len(token_id_gathered)}; prob_gathered length: {len(prob_gathered)}; label_np shape: {label_np.shape}")
-            
-            # Create Arrow arrays
-            id_cnt_array = pa.array(id_cnt_np, type=pa.int32())
-            token_id_array = pa.array(token_id_gathered, type=pa.list_(pa.int32()))
-            prob_array = pa.array(prob_gathered, type=pa.list_(pa.float16()))
-            label_array = pa.array(label_np, type=pa.int32())
-            
-            # Create batch and write
-            batch = pa.RecordBatch.from_arrays(
-                [id_cnt_array, token_id_array, prob_array, label_array],
-                ['id_cnt', 'token_id', 'prob', 'label']
-            )
-            self.arrow_writer.write_batch(batch)
-        
-        self.accelerator.wait_for_everyone()
+        # Create batch and write
+        batch = pa.RecordBatch.from_arrays(
+            [id_cnt_array, token_id_array, prob_array, label_array],
+            ['id_cnt', 'token_id', 'prob', 'label']
+        )
+        self.arrow_writer.write_batch(batch)
     
     def process(self):
         """Main processing loop"""
         logger.info(f"Process {self.process_index}: Starting kNN search and processing")
-        
+
         for batch_idx, batch in enumerate(tqdm(self.dataloader, desc=f"Process {self.process_index}")):
-            keys = batch['keys'].to(torch.float16).to(self.device)
-            vals = batch['vals'].to(torch.int32).to(self.device)
+            # Keep keys on CPU: FAISS is CPU-only, sending to NPU and back is wasteful.
+            keys = batch['keys'].to(torch.float32)
+            vals = batch['vals'].to(torch.int32)
             
             # Perform kNN search
             dists, knns = self.get_knns(keys, self.ignore_first)
@@ -265,12 +316,14 @@ class KNNSearchMulti:
             
             # Save step data
             self._save_step_data(id_cnt, token_id, prob, vals)
+
+            if batch_idx % 50 == 0:
+                logger.info(f"Process {self.process_index}: batch {batch_idx}/28564 done")
         
-        # Close Arrow writer on main process
-        if self.process_index == 0:
-            self.arrow_writer.close()
-            self.arrow_file.close()
-            logger.info(f"Finished writing to {self.output_path}")
+        # Close Arrow writer for each process
+        self.arrow_writer.close()
+        self.arrow_file.close()
+        logger.info(f"Process {self.process_index}: Finished writing to {self.output_path}")
 
 def parse_args():
     import argparse
